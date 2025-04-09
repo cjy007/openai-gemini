@@ -186,6 +186,25 @@ async function handleCompletions (req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
+const adjustProps = (schemaPart) => {
+  if (typeof schemaPart !== "object" || schemaPart === null) {
+    return;
+  }
+  if (Array.isArray(schemaPart)) {
+    schemaPart.forEach(adjustProps);
+  } else {
+    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
+      delete schemaPart.additionalProperties;
+    }
+    Object.values(schemaPart).forEach(adjustProps);
+  }
+};
+const adjustSchema = (schema) => {
+  const obj = schema[schema.type];
+  delete obj.strict;
+  return adjustProps(schema);
+};
+
 const harmCategory = [
   "HARM_CATEGORY_HATE_SPEECH",
   "HARM_CATEGORY_SEXUALLY_EXPLICIT",
@@ -220,6 +239,7 @@ const transformConfig = (req) => {
   if (req.response_format) {
     switch(req.response_format.type) {
       case "json_schema":
+        adjustSchema(req.response_format);
         cfg.responseSchema = req.response_format.json_schema?.schema;
         if (cfg.responseSchema && "enum" in cfg.responseSchema) {
           cfg.responseMimeType = "text/x.enum";
@@ -255,7 +275,7 @@ const parseImg = async (url) => {
   } else {
     const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
     if (!match) {
-      throw new Error("Invalid image data: " + url);
+      throw new HttpError("Invalid image data: " + url, 400);
     }
     ({ mimeType, data } = match.groups);
   }
@@ -267,13 +287,57 @@ const parseImg = async (url) => {
   };
 };
 
-const transformMsg = async ({ role, content }) => {
+const transformMsg = async ({ content, tool_calls, tool_call_id }, fnames) => {
   const parts = [];
+  if (tool_call_id !== undefined) {
+    let response;
+    try {
+      response = JSON.parse(content);
+    } catch (err) {
+      console.error("Error parsing function response content:", err);
+      throw new HttpError("Invalid function response: " + content, 400);
+    }
+    if (typeof response !== "object" || Array.isArray(response)) {
+      response = { result: response };
+    }
+    parts.push({
+      functionResponse: {
+        id: tool_call_id.startsWith("{") ? null : tool_call_id,
+        name: fnames[tool_call_id],
+        response,
+      }
+    });
+    return parts;
+  }
+  if (tool_calls) {
+    for (const tcall of tool_calls) {
+      if (tcall.type !== "function") {
+        throw new HttpError(`Unsupported tool_call type: "${tcall.type}"`, 400);
+      }
+      const { function: { arguments: argstr, name }, id } = tcall;
+      let args;
+      try {
+        args = JSON.parse(argstr);
+      } catch (err) {
+        console.error("Error parsing function arguments:", err);
+        throw new HttpError("Invalid function arguments: " + argstr, 400);
+      }
+      parts.push({
+        functionCall: {
+          id: id.startsWith("{") ? null : id,
+          name,
+          args,
+        }
+      });
+      fnames[id] = name;
+    }
+    return parts;
+  }
   if (!Array.isArray(content)) {
     // system, user: string
     // assistant: string or null (Required unless tool_calls is specified.)
     parts.push({ text: content });
-    return { role, parts };
+    return parts;
   }
   // user:
   // An array of content parts with a defined type.
@@ -296,26 +360,40 @@ const transformMsg = async ({ role, content }) => {
         });
         break;
       default:
-        throw new TypeError(`Unknown "content" item type: "${item.type}"`);
+        throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
     }
   }
   if (content.every(item => item.type === "image_url")) {
     parts.push({ text: "" }); // to avoid "Unable to submit request because it must have a text parameter"
   }
-  return { role, parts };
+  return parts;
 };
 
 const transformMessages = async (messages) => {
   if (!messages) { return; }
   const contents = [];
   let system_instruction;
+  const fnames = {}; // cache function names by tool_call_id between messages
   for (const item of messages) {
     if (item.role === "system") {
-      delete item.role;
-      system_instruction = await transformMsg(item);
+      system_instruction = { parts: await transformMsg(item) };
     } else {
-      item.role = item.role === "assistant" ? "model" : "user";
-      contents.push(await transformMsg(item));
+      if (item.role === "assistant") {
+        item.role = "model";
+      } else if (item.role === "tool") {
+        const prev = contents[contents.length - 1];
+        if (prev?.role === "function") {
+          prev.parts.push(...await transformMsg(item, fnames));
+          continue;
+        }
+        item.role = "function"; // ignored
+      } else if (item.role !== "user") {
+        throw HttpError(`Unknown message role: "${item.role}"`, 400);
+      }
+      contents.push({
+        role: item.role,
+        parts: await transformMsg(item, fnames)
+      });
     }
   }
   if (system_instruction && contents.length === 0) {
@@ -325,10 +403,32 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
+const transformTools = (req) => {
+  let tools, tool_config;
+  if (req.tools) {
+    const funcs = req.tools.filter(tool => tool.type === "function");
+    funcs.forEach(adjustSchema);
+    tools = [{ function_declarations: funcs.map(schema => schema.function) }];
+  }
+  if (req.tool_choice) {
+    const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
+    if (allowed_function_names || typeof req.tool_choice === "string") {
+      tool_config = {
+        function_calling_config: {
+          mode: allowed_function_names ? "ANY" : req.tool_choice.toUpperCase(),
+          allowed_function_names
+        }
+      };
+    }
+  }
+  return { tools, tool_config };
+};
+
 const transformRequest = async (req) => ({
   ...await transformMessages(req.messages),
   safetySettings,
   generationConfig: transformConfig(req),
+  ...transformTools(req),
 });
 
 const generateChatcmplId = () => {
@@ -344,17 +444,34 @@ const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
   //"OTHER": "OTHER",
-  // :"function_call",
 };
 const SEP = "\n\n|>";
-const transformCandidates = (key, cand) => ({
-  index: cand.index || 0, // 0-index is absent in new -002 models response
-  [key]: {
-    role: "assistant",
-    content: cand.content?.parts.map(p => p.text).join(SEP) },
-  logprobs: null,
-  finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
-});
+const transformCandidates = (key, cand) => {
+  const message = { role: "assistant", content: [] };
+  for (const part of cand.content?.parts ?? []) {
+    if (part.functionCall) {
+      const fc = part.functionCall;
+      message.tool_calls = message.tool_calls ?? [];
+      message.tool_calls.push({
+        id: fc.id ?? `{${fc.name}}`,
+        type: "function",
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(fc.args),
+        }
+      });
+    } else {
+      message.content.push(part.text);
+    }
+  }
+  message.content = message.content.join(SEP) || null;
+  return {
+    index: cand.index || 0, // 0-index is absent in new -002 models response
+    [key]: message,
+    logprobs: null,
+    finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+  };
+};
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
@@ -395,10 +512,23 @@ async function parseStreamFlush (controller) {
   }
 }
 
-function transformResponseStream (data, stop, first) {
+function transformResponseStream (data, special) {
   const item = transformCandidatesDelta(data.candidates[0]);
-  if (stop) { item.delta = {}; } else { item.finish_reason = null; }
-  if (first) { item.delta.content = ""; } else { delete item.delta.role; }
+  switch (special) {
+    case "stop":
+      if (item.delta.tool_calls) {
+        item.finish_reason = "tool_calls";
+      }
+      item.delta = {};
+      break;
+    case "first":
+      item.delta.content = "";
+      delete item.delta.tool_calls;
+      // eslint-disable-next-line no-fallthrough
+    default:
+      delete item.delta.role;
+      item.finish_reason = null;
+  }
   const output = {
     id: this.id,
     choices: [item],
@@ -435,7 +565,7 @@ async function toOpenAiStream (chunk, controller) {
   console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   cand.index = cand.index || 0; // absent in new -002 models response
   if (!this.last[cand.index]) {
-    controller.enqueue(transform(data, false, "first"));
+    controller.enqueue(transform(data, "first"));
   }
   this.last[cand.index] = data;
   if (cand.content) { // prevent empty data (e.g. when MAX_TOKENS)
